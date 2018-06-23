@@ -55,23 +55,29 @@ We will do the following steps in order:
 
 Using ``torchvision``, it’s extremely easy to load CIFAR10.
 """
+from __future__ import print_function, division
 import torch
 import torch.nn as nn
+import math
 from torch.nn import init
+import torch.optim as optim
+from torch.optim import lr_scheduler
 import torchvision
 import torchvision.transforms as transforms
 import os
 import argparse
 from tensorboardX import SummaryWriter
-import net_sphere
+import face_layers
 
+import torch.nn.functional as F
+import torchvision.models as models
 ########################################################################
 # The output of torchvision datasets are PILImage images of range [0, 1].
 # We transform them to Tensors of normalized range [-1, 1]
 
 parser = argparse.ArgumentParser(description='PyTorch cifar10 test experiment')
 parser.add_argument('--net','-n',default='resnet',type=str,choices=['resnet','naive'])
-parser.add_argument('--loss',default='softmax',type=str,choices=['softmax','sphere','cosface'])
+parser.add_argument('--loss',default='softmax',type=str,choices=['softmax','arcface','cosface'])
 parser.add_argument('--lr',default=0.01,type=float)
 parser.add_argument('--test_only','-t',action='store_true',help='only test')
 parser.add_argument('--log_to_file',action='store_true',help='log file')
@@ -108,6 +114,7 @@ testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
 classes = ('plane', 'car', 'bird', 'cat',
            'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ########################################################################
 # Let us show some of the training images, for fun.
 
@@ -193,10 +200,7 @@ imshow(torchvision.utils.make_grid(images))
 # Copy the neural network from the Neural Networks section before and modify it to
 # take 3-channel images (instead of 1-channel images as it was defined).
 
-from torch.autograd import Variable
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
+
 
 model = args.net
 if args.exp_dir !='':
@@ -224,7 +228,7 @@ class Net(nn.Module):
         if args.loss == 'softmax':
             self.fc3 = nn.Linear(32, 10)
         elif args.loss == 'sphere':
-            self.fc3 = net_sphere.AngleLinear(32,10)
+            self.fc3 = face_layers.AngleLinear(32,10)
 
     def forward(self, x):
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
@@ -238,30 +242,42 @@ class Net(nn.Module):
         x = self.fc3(x)
         return x
 
-class resnet(nn.Module):
-    def __init__(self,model):
-        super(resnet,self).__init__()
+class facenet(nn.Module):
+    def __init__(self,model,loss):
+        super(facenet,self).__init__()
         self.resnet_layer =nn.Sequential(*list(model.children())[:-1])
-    def forward(self,x):
+        self.num_last = model.fc.in_features
+        self.loss = loss
+        if loss =='softmax':
+            self.fc = nn.Linear(self.num_last, 10)
+        elif loss =='cosface':
+            self.fc = face_layers.CosMarginProduct(self.num_last,10)
+        elif loss == 'arcface':
+            self.fc = face_layers.ArcMarginProduct(self.num_last,10)
+    def forward(self,x,label=None):
         x = self.resnet_layer(x)
-        x = x.view(-1,num_fc)
+        x = x.view(-1,self.num_last)
+        if self.loss =='softmax':
+            x = self.fc(x)
+        elif self.loss == 'cosface' or 'arcface':
+            x = self.fc(x,label)
         return x
 
 
 
 if args.net=='naive':
 
-    net=Net().cuda()
+    net=Net().to(device)
     initialize_weights(net)
 elif args.net=='resnet':
 
     basenet = models.resnet18(pretrained=False)
-    num_fc = basenet.fc.in_features
+    # num_fc = basenet.fc.in_features
     root = '/root/Cloud/Pytorch_Pretrained/'
     res18_path = os.path.join(root, 'ResNet', 'resnet18-5c106cde.pth')
     basenet.load_state_dict(torch.load(res18_path))
-    net = resnet(basenet)
-    net = net.cuda()
+    net = facenet(basenet)
+    net = net.to(device)
 
 
 
@@ -270,16 +286,13 @@ elif args.net=='resnet':
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # Let's use a Classification Cross-Entropy loss and SGD with momentum
 
-import torch.optim as optim
 
-if args.loss == 'sphere':
-    criterion = net_sphere.AngleLoss()
-else :
-    criterion = nn.CrossEntropyLoss()
+
+criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9)
 # ckpt_file = 'epoch_29_ckpt.pth'
 # resume = False
-
+exp_lr_scher = lr_
 
 ########################################################################
 # 4. Train the network
@@ -311,23 +324,13 @@ def main():
             inputs, labels = data
 
             # wrap them in Variable
-            inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
+            inputs, labels = inputs.to(device),labels.to(device)
 
             # zero the parameter gradients
             optimizer.zero_grad()
 
             # forward + backward + optimize
-            outputs = net(inputs)
-            if args.loss == 'softmax':
-                net.fc = nn.Linear(num_fc,10).cuda()
-                outputs = net.fc(outputs)
-            elif args.loss == 'sphere':
-                net.fc = net_sphere.AngleLinear(num_fc,10).cuda()
-                outputs = net.fc(outputs)
-            elif args.loss =='cosface':
-                net.fc = net_sphere.MarginCosineProduct(num_fc,10).cuda()
-                outputs = net.fc(outputs,labels)
-
+            outputs = net(inputs,labels)
 
             # print (outputs.size())
             loss = criterion(outputs, labels)
@@ -335,7 +338,7 @@ def main():
             optimizer.step()
 
             # print statistics
-            running_loss += loss.data[0]
+            running_loss += loss.item()
             train_loss.update(running_loss)
             if (batch+1) % 50 == 0:    # print every 1000 mini-batches
                 print('[%d, %5d] loss: %.5f' %
@@ -401,13 +404,12 @@ def test(test_only=False):
     total = 0
     for data in testloader:
         images, labels = data
-        images = images.cuda()
-        labels = labels
-        outputs = net(Variable(images).cuda())
+        images,labels = images.to(device),labels.to(device)
+        outputs = net(images)
         if args.loss == 'softmax':
-            _, predicted = torch.max(outputs.data.cpu(), 1)
+            _, predicted = torch.max(outputs.item(), 1)
         elif args.loss == 'sphere':
-            _, predicted = torch.max(outputs[0].data.cpu(), 1)
+            _, predicted = torch.max(outputs.item(), 1)
         total += labels.size(0)
         correct += (predicted == labels).sum()
     test_acc = 100.0 * correct / total
@@ -427,11 +429,8 @@ def test(test_only=False):
     class_total = list(0. for i in range(10))
     for data in testloader:
         images, labels = data
-        outputs = net(Variable(images).cuda())
-        if args.loss == 'softmax':
-            _, predicted = torch.max(outputs.data.cpu(), 1)
-        elif args.loss == 'sphere':
-            _, predicted = torch.max(outputs[0].data.cpu(), 1)
+        outputs = net(images.to(device))
+        _, predicted = torch.max(outputs.item(), 1)
         # print (type(predicted),type(labels))
         c = (predicted == labels).squeeze()
         for i in range(10):
